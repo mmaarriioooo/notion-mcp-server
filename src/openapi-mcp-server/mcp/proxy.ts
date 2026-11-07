@@ -5,6 +5,7 @@ import { OpenAPIToMCPConverter } from '../openapi/parser'
 import { HttpClient, HttpClientError } from '../client/http-client'
 import { OpenAPIV3 } from 'openapi-types'
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
+import { deserializeParams } from './deserialize'
 
 type PathItemObject = OpenAPIV3.PathItemObject & {
   get?: OpenAPIV3.OperationObject
@@ -23,112 +24,14 @@ type NewToolDefinition = {
   }>
 }
 
-/**
- * Recursively deserialize stringified JSON values in parameters.
- * This handles the case where MCP clients (like Cursor, Claude Code, and some
- * SDKs) double-serialize nested object/array parameters, sending them as JSON
- * strings instead of structured values.
- *
- * The whole argument tree is walked uniformly: every object property and every
- * array element is visited, JSON-looking strings are decoded, and the decoded
- * result is walked again. This normalizes deeply nested cases — including a
- * stringified object that sits inside an array element object (e.g.
- * `{ children: [{ paragraph: '{"rich_text":[...]}' }] }`) and values that were
- * JSON-encoded more than once (e.g. `JSON.stringify(JSON.stringify(parent))`) —
- * before the request is forwarded to the Notion API.
- *
- * @see https://github.com/makenotion/notion-mcp-server/issues/176
- */
-function deserializeParams(params: Record<string, unknown>): Record<string, unknown> {
-  const result: Record<string, unknown> = {}
-  for (const [key, value] of Object.entries(params)) {
-    result[key] = deserializeValue(value)
-  }
-  return result
-}
-
-/**
- * Normalize a single value: decode a JSON-encoded string into the structured
- * value it represents (recursing into the result), walk into every array
- * element, and walk into every nested object property. Non-JSON strings and
- * scalars are returned unchanged, so values the schema legitimately wants as
- * strings (and numbers/booleans encoded as strings) are left intact.
- */
-function deserializeValue(value: unknown): unknown {
-  if (typeof value === 'string') {
-    return unwrapJsonString(value)
-  }
-
-  if (Array.isArray(value)) {
-    return value.map(deserializeValue)
-  }
-
-  if (typeof value === 'object' && value !== null) {
-    const result: Record<string, unknown> = {}
-    for (const [key, nested] of Object.entries(value)) {
-      result[key] = deserializeValue(nested)
-    }
-    return result
-  }
-
-  return value
-}
-
-// Bound how many JSON-decode passes we attempt on a single string. One pass
-// handles the common single-encoding; extra passes absorb double/triple
-// serialization without unbounded work on adversarial input.
-const MAX_UNWRAP_DEPTH = 3
-
-/**
- * Resolve a (possibly multiply-)JSON-encoded string to the object or array it
- * represents. Only strings that ultimately decode to an object or array are
- * transformed (and then recursively normalized); a string that decodes to a
- * scalar (number/boolean/null) or to another plain string is returned
- * unchanged, so genuine string values are never corrupted.
- */
-function unwrapJsonString(value: string): unknown {
-  let current = value
-  for (let depth = 0; depth < MAX_UNWRAP_DEPTH; depth++) {
-    const trimmed = current.trim()
-    // Only attempt a parse when the string could encode an object/array
-    // (`{...}`/`[...]`) or wrap one in a JSON string literal (`"..."`). This
-    // skips the common case of ordinary text without touching JSON.parse.
-    const couldBeEncoded =
-      (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
-      (trimmed.startsWith('[') && trimmed.endsWith(']')) ||
-      (trimmed.startsWith('"') && trimmed.endsWith('"'))
-    if (!couldBeEncoded) {
-      break
-    }
-
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(trimmed)
-    } catch {
-      break
-    }
-
-    if (typeof parsed === 'object' && parsed !== null) {
-      return deserializeValue(parsed)
-    }
-    if (typeof parsed === 'string') {
-      // Peeled one layer of JSON-string encoding; loop to see whether it wraps
-      // a structured value (double-encoding).
-      current = parsed
-      continue
-    }
-    // Decoded to a scalar — not a structured value; leave the original intact.
-    break
-  }
-  return value
-}
-
 // import this class, extend and return server
 export class MCPProxy {
   private server: Server
   private httpClient: HttpClient
   private tools: Record<string, NewToolDefinition>
   private openApiLookup: Record<string, OpenAPIV3.OperationObject & { method: string; path: string }>
+  // Input schema per tool name (same keys as openApiLookup), used for schema-aware argument normalization
+  private inputSchemas: Record<string, IJsonSchema> = {}
 
   /**
    * @param headers Notion API headers to authenticate with. When omitted, the
@@ -155,6 +58,11 @@ export class MCPProxy {
     const { tools, openApiLookup } = converter.convertToMCPTools()
     this.tools = tools
     this.openApiLookup = openApiLookup
+    for (const [toolName, def] of Object.entries(tools)) {
+      for (const method of def.methods) {
+        this.inputSchemas[`${toolName}-${method.name}`] = method.inputSchema
+      }
+    }
 
     this.setupHandlers()
   }
@@ -204,7 +112,10 @@ export class MCPProxy {
 
       // Deserialize any stringified JSON parameters (fixes double-serialization bug)
       // See: https://github.com/makenotion/notion-mcp-server/issues/176
-      const deserializedParams = params ? deserializeParams(params as Record<string, unknown>) : {}
+      // Schema-aware: strings are only decoded where the tool schema accepts an object/array
+      const deserializedParams = params
+        ? deserializeParams(params as Record<string, unknown>, this.inputSchemas[name])
+        : {}
 
       try {
         // Execute the operation
