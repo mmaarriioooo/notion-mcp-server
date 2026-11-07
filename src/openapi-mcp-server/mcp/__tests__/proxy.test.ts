@@ -1,6 +1,6 @@
 import { MCPProxy } from '../proxy'
 import { OpenAPIV3 } from 'openapi-types'
-import { HttpClient } from '../../client/http-client'
+import { HttpClient, HttpClientError } from '../../client/http-client'
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest'
 
@@ -114,6 +114,31 @@ describe('MCPProxy', () => {
             text: JSON.stringify({ message: 'success' }),
           },
         ],
+      })
+    })
+
+    it('should return isError with HTTP status when the Notion API call fails', async () => {
+      // HttpClientError is auto-mocked, so build an instance without running the mocked constructor
+      const apiError = Object.assign(Object.create(HttpClientError.prototype), {
+        message: '404 Not Found',
+        status: 404,
+        data: { object: 'error', code: 'object_not_found', message: 'Could not find page' },
+      })
+      ;(HttpClient.prototype.executeOperation as ReturnType<typeof vi.fn>).mockRejectedValue(apiError)
+
+      const server = (proxy as any).server
+      const handlers = server.setRequestHandler.mock.calls.flatMap((x: unknown[]) => x).filter((x: unknown) => typeof x === 'function')
+      const callToolHandler = handlers[1]
+
+      const result = await callToolHandler({ params: { name: 'API-getTest', arguments: {} } })
+
+      expect(result.isError).toBe(true)
+      expect(JSON.parse(result.content[0].text)).toEqual({
+        status: 'error',
+        http_status: 404,
+        object: 'error',
+        code: 'object_not_found',
+        message: 'Could not find page',
       })
     })
 

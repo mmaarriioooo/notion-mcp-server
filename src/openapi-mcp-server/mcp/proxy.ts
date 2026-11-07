@@ -224,13 +224,18 @@ export class MCPProxy {
         if (error instanceof HttpClientError) {
           console.error('HttpClientError encountered, returning structured error', { status: error.status })
           const data = error.data?.response?.data ?? error.data ?? {}
+          // Mark the result as a tool error so MCP clients and models can tell a
+          // failed Notion API call apart from a successful one, and include the
+          // HTTP status code so the cause (e.g. 401, 404, 429) is visible.
           return {
+            isError: true,
             content: [
               {
                 type: 'text',
                 text: JSON.stringify({
-                  status: 'error', // TODO: get this from http status code?
-                  ...(typeof data === 'object' ? data : { data: data }),
+                  status: 'error',
+                  http_status: error.status,
+                  ...(typeof data === 'object' && data !== null ? data : { data: data }),
                 }),
               },
             ],
