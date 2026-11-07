@@ -4,9 +4,25 @@ import type { AxiosInstance } from 'axios'
 import { Headers } from './polyfill-headers'
 import { isFileUploadParameter } from '../openapi/file-upload'
 
+export type RetryConfig = {
+  /** How many times a rate-limited (429) request is retried. Default: 3 */
+  maxRetries?: number
+  /**
+   * Longest wait before a single retry, in milliseconds. If Notion asks for a
+   * longer wait (via Retry-After), the 429 is returned immediately instead of
+   * blocking the tool call. Default: 10000
+   */
+  maxDelayMs?: number
+  /** Wait used when the response has no usable Retry-After header; doubles per attempt. Default: 1000 */
+  baseDelayMs?: number
+  /** Injectable for tests. */
+  sleep?: (ms: number) => Promise<void>
+}
+
 export type HttpClientConfig = {
   baseUrl: string
   headers?: Record<string, string>
+  retry?: RetryConfig
 }
 
 export type HttpClientResponse<T = any> = {
@@ -100,6 +116,41 @@ export class HttpClient {
   }
 
   /**
+   * Run a request, retrying it when Notion answers 429 (rate limited).
+   *
+   * Notion allows an average of ~3 requests per second per integration and
+   * tells clients how long to back off via the Retry-After header (seconds).
+   * A 429 means the request was not processed, so retrying is safe for every
+   * method. Other errors are rethrown unchanged.
+   */
+  private async callWithRateLimitRetry<R>(request: () => Promise<R>): Promise<R> {
+    const maxRetries = this.config.retry?.maxRetries ?? 3
+    const maxDelayMs = this.config.retry?.maxDelayMs ?? 10_000
+    const baseDelayMs = this.config.retry?.baseDelayMs ?? 1_000
+    const sleep = this.config.retry?.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await request()
+      } catch (error: any) {
+        if (error?.response?.status !== 429 || attempt >= maxRetries) {
+          throw error
+        }
+        const retryAfterMs = parseRetryAfterMs(error.response.headers)
+        const delayMs = retryAfterMs ?? baseDelayMs * 2 ** attempt
+        if (delayMs > maxDelayMs) {
+          // Waiting that long would stall the tool call; surface the 429 instead.
+          throw error
+        }
+        if (process.env.NODE_ENV !== 'test') {
+          console.error(`Rate limited by Notion (429), retrying in ${delayMs}ms (attempt ${attempt + 1}/${maxRetries})`)
+        }
+        await sleep(delayMs)
+      }
+    }
+  }
+
+  /**
    * Execute an OpenAPI operation
    */
   async executeOperation<T = any>(
@@ -162,7 +213,9 @@ export class HttpClient {
       }
 
       // first argument is url parameters, second is body parameters
-      const response = await operationFn(urlParameters, hasBody ? bodyParams : undefined, requestConfig)
+      const response: any = await this.callWithRateLimitRetry(() =>
+        operationFn(urlParameters, hasBody ? bodyParams : undefined, requestConfig),
+      )
 
       // Convert axios headers to Headers object
       const responseHeaders = new Headers()
@@ -194,4 +247,33 @@ export class HttpClient {
       throw error
     }
   }
+}
+
+/**
+ * Read a Retry-After header (delay in seconds, or an HTTP date) as milliseconds.
+ * Returns undefined when the header is missing or unparseable.
+ */
+function parseRetryAfterMs(headers: unknown): number | undefined {
+  if (!headers || typeof headers !== 'object') return undefined
+  let raw: unknown
+  const get = (headers as { get?: unknown }).get
+  if (typeof get === 'function') {
+    raw = get.call(headers, 'retry-after')
+  }
+  if (raw === undefined || raw === null) {
+    const entry = Object.entries(headers as Record<string, unknown>).find(([key]) => key.toLowerCase() === 'retry-after')
+    raw = entry?.[1]
+  }
+  if (raw === undefined || raw === null || raw === '') return undefined
+
+  const value = String(raw).trim()
+  const seconds = Number(value)
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.ceil(seconds * 1000)
+  }
+  const date = Date.parse(value)
+  if (!Number.isNaN(date)) {
+    return Math.max(0, date - Date.now())
+  }
+  return undefined
 }

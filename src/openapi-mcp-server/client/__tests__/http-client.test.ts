@@ -246,6 +246,76 @@ describe('HttpClient', () => {
     })
   })
 
+  describe('rate limit retry (429)', () => {
+    const rateLimited = (retryAfter?: string) => ({
+      response: {
+        status: 429,
+        statusText: 'Too Many Requests',
+        data: { object: 'error', code: 'rate_limited', message: 'Rate limited' },
+        headers: retryAfter === undefined ? {} : { 'retry-after': retryAfter },
+      },
+    })
+    const ok = { data: { id: 1 }, status: 200, headers: {} }
+    let sleep: ReturnType<typeof vi.fn<(ms: number) => Promise<void>>>
+    let retryingClient: HttpClient
+
+    beforeEach(() => {
+      sleep = vi.fn<(ms: number) => Promise<void>>().mockResolvedValue(undefined)
+      retryingClient = new HttpClient({ baseUrl: 'https://api.example.com', retry: { sleep } }, sampleSpec)
+    })
+
+    it('retries after the Retry-After delay and returns the successful response', async () => {
+      mockApi.getPet.mockRejectedValueOnce(rateLimited('2')).mockResolvedValueOnce(ok)
+
+      const result = await retryingClient.executeOperation(getPetOperation, { petId: 1 })
+
+      expect(result.data).toEqual({ id: 1 })
+      expect(mockApi.getPet).toHaveBeenCalledTimes(2)
+      expect(sleep).toHaveBeenCalledWith(2000)
+    })
+
+    it('uses exponential backoff when Retry-After is missing', async () => {
+      mockApi.getPet
+        .mockRejectedValueOnce(rateLimited())
+        .mockRejectedValueOnce(rateLimited())
+        .mockResolvedValueOnce(ok)
+
+      await retryingClient.executeOperation(getPetOperation, { petId: 1 })
+
+      expect(sleep.mock.calls).toEqual([[1000], [2000]])
+    })
+
+    it('gives up after 3 retries and throws the 429 as HttpClientError', async () => {
+      mockApi.getPet.mockRejectedValue(rateLimited('1'))
+
+      await expect(retryingClient.executeOperation(getPetOperation, { petId: 1 })).rejects.toMatchObject({
+        name: 'HttpClientError',
+        status: 429,
+      })
+      expect(mockApi.getPet).toHaveBeenCalledTimes(4)
+      expect(sleep).toHaveBeenCalledTimes(3)
+      mockApi.getPet.mockReset()
+    })
+
+    it('does not wait when Notion asks for longer than the maximum delay', async () => {
+      mockApi.getPet.mockRejectedValueOnce(rateLimited('60'))
+
+      await expect(retryingClient.executeOperation(getPetOperation, { petId: 1 })).rejects.toMatchObject({ status: 429 })
+      expect(sleep).not.toHaveBeenCalled()
+      expect(mockApi.getPet).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not retry other errors', async () => {
+      mockApi.getPet.mockRejectedValueOnce({
+        response: { status: 500, statusText: 'Internal Server Error', data: {}, headers: {} },
+      })
+
+      await expect(retryingClient.executeOperation(getPetOperation, { petId: 1 })).rejects.toMatchObject({ status: 500 })
+      expect(sleep).not.toHaveBeenCalled()
+      expect(mockApi.getPet).toHaveBeenCalledTimes(1)
+    })
+  })
+
   it('should send body parameters in request body for POST operations', async () => {
     // Setup mock API with the new operation
     mockApi.testOperation = vi.fn().mockResolvedValue({
